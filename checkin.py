@@ -3,7 +3,7 @@ import json
 import time
 import random
 import requests
-
+from serverchan_sdk import sc_send
 
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
 STATUS_URL = "https://glados.cloud/api/user/status"
@@ -52,20 +52,18 @@ def push_telegram(bot_token: str, chat_id: str, title: str, content: str):
 def push_serverchan(sendkey: str, title: str, content: str):
     """通过 Server酱推送到微信"""
     if not sendkey:
+        print("⚠️ 未配置 Server酱推送，请在 Secrets 中配置 SCT_SENDKEY")
         return
 
-    url = f"https://sctapi.ftqq.com/{sendkey}.send"
-    data = {
-        "title": title,
-        "desp": content,
-    }
-
     try:
-        resp = requests.post(url, data=data, timeout=TIMEOUT)
-        if resp.status_code == 200:
-            print("✅ Server酱微信推送请求已发送")
-        else:
-            print(f"⚠️ Server酱推送失败: HTTP {resp.status_code} | {resp.text}")
+        response = sc_send(
+            sendkey,
+            title,
+            content,
+            {"tags": "GLaDOS|签到"}
+        )
+        print("✅ Server酱微信推送完成")
+        print(response)
     except Exception as e:
         print(f"⚠️ Server酱推送异常: {e}")
 
@@ -151,7 +149,6 @@ def main():
     content = "\n".join(lines)
 
     print(content)
-    
     push_serverchan(sct_sendkey, title, content)
 
 if __name__ == "__main__":
