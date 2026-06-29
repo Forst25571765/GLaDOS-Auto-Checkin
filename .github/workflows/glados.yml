@@ -21,6 +21,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests
+          pip install serverchan-sdk
 
       - name: Run checkin
         run: python checkin.py
