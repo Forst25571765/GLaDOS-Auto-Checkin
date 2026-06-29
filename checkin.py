@@ -96,9 +96,12 @@ def main():
             )
 
             j = safe_json(r)
+            print("CHECKIN_STATUS:", r.status_code)
+            print("CHECKIN_RESP:", j if j else r.text)
+
             msg = j.get("message", "")
             msg_lower = msg.lower()
-
+            
             if "got" in msg_lower:
                 ok += 1
                 points = j.get("points", "-")
