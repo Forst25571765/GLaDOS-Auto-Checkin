@@ -48,7 +48,26 @@ def push_telegram(bot_token: str, chat_id: str, title: str, content: str):
             print(f"⚠️ Telegram 推送失败: HTTP {resp.status_code} | {resp.text}")
     except Exception as e:
         print(f"⚠️ Telegram 推送异常: {e}")
+        
+def push_serverchan(sendkey: str, title: str, content: str):
+    """通过 Server酱推送到微信"""
+    if not sendkey:
+        return
 
+    url = f"https://sctapi.ftqq.com/{sendkey}.send"
+    data = {
+        "title": title,
+        "desp": content,
+    }
+
+    try:
+        resp = requests.post(url, data=data, timeout=TIMEOUT)
+        if resp.status_code == 200:
+            print("✅ Server酱微信推送请求已发送")
+        else:
+            print(f"⚠️ Server酱推送失败: HTTP {resp.status_code} | {resp.text}")
+    except Exception as e:
+        print(f"⚠️ Server酱推送异常: {e}")
 
 def push_all(bot_token: str, chat_id: str, title: str, content: str):
     """推送到 Telegram（如果已配置）"""
@@ -69,6 +88,7 @@ def main():
     bot_token = os.getenv("TG_BOT_TOKEN", "")
     chat_id = os.getenv("TG_CHAT_ID", "")
     cookies_env = os.getenv("COOKIES", "")
+    sct_sendkey = os.getenv("SCT_SENDKEY", "")
     cookies = [c.strip() for c in cookies_env.split("&") if c.strip()]
 
     if not cookies:
@@ -132,8 +152,7 @@ def main():
 
     print(content)
     
-    push_all(bot_token, chat_id, title, content)
-
+    push_serverchan(sct_sendkey, title, content)
 
 if __name__ == "__main__":
     main()
