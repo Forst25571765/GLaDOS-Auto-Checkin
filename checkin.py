@@ -20,7 +20,11 @@ HEADERS_BASE = {
 }
 PAYLOAD = {"token": "glados.cloud"}
 TIMEOUT = (5, 15)
+# Allow slow check-in responses while keeping the shorter timeout for
+# optional account queries and Telegram requests.
+CHECKIN_TIMEOUT = (10, 60)
 MAX_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 15
 SESSION_KEY = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess(?P<sig>\.sig)?$")
 
 
@@ -75,13 +79,16 @@ def safe_json(response):
 
 
 def request_json(session, method, url, headers):
+    timeout = CHECKIN_TIMEOUT if url == CHECKIN_URL else TIMEOUT
+    label = "CHECKIN" if method == "POST" else "ACCOUNT"
     for attempt in range(MAX_ATTEMPTS):
         try:
-            kwargs = {"headers": headers, "timeout": TIMEOUT}
+            print(f"{label}_ATTEMPT: {attempt + 1}/{MAX_ATTEMPTS} "
+                  f"(connect={timeout[0]}s, read={timeout[1]}s)")
+            kwargs = {"headers": headers, "timeout": timeout}
             if method == "POST":
                 kwargs["json"] = PAYLOAD
             response = session.request(method, url, **kwargs)
-            label = "CHECKIN" if method == "POST" else "ACCOUNT"
             print(f"{label}_STATUS:", response.status_code)
             response.raise_for_status()
             data = response.json()
@@ -95,8 +102,10 @@ def request_json(session, method, url, headers):
                          or status == 429 or (status is not None and 500 <= status < 600))
             if not retryable or attempt == MAX_ATTEMPTS - 1:
                 raise
-            print(f"⚠️ 请求暂时失败（{type(error).__name__}），正在重试 {attempt + 1}/{MAX_ATTEMPTS - 1}")
-            time.sleep(2 ** (attempt + 1))
+            delay = min(RETRY_DELAY_SECONDS * (2 ** attempt), 30)
+            print(f"⚠️ {label} 请求暂时失败（{type(error).__name__}，HTTP {status or '-'}），"
+                  f"{delay} 秒后重试 {attempt + 1}/{MAX_ATTEMPTS - 1}")
+            time.sleep(delay)
 
 
 def redact_message(message, cookie):
@@ -151,6 +160,9 @@ def checkin_account(session, cookie, index):
         status = response.status_code if response is not None else None
         if status in (401, 403):
             account["status"] = f"❌ 鉴权失败（HTTP {status}）：请重新登录并更新 COOKIES"
+        elif isinstance(error, requests.Timeout):
+            account["status"] = (f"❌ 网络超时（{type(error).__name__}）："
+                                 f"{MAX_ATTEMPTS} 次请求后仍未确认签到结果，请稍后重跑")
         else:
             account["status"] = f"❌ 请求异常（{type(error).__name__}，HTTP {status or '-'}）"
         return account

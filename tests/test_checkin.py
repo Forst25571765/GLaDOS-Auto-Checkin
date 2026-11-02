@@ -5,7 +5,7 @@ from pathlib import Path
 import runpy
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import requests
 
@@ -151,7 +151,7 @@ class CheckinTests(unittest.TestCase):
         self.supply(response({}, status=503), success(), details())
         self.assertEqual(checkin.main(), 0)
         self.assertEqual(self.session.request.call_count, 3)
-        self.sleep.assert_called_once_with(2)
+        self.sleep.assert_called_once_with(15)
 
     def test_rate_limit_retries_then_succeeds(self):
         self.supply(response({}, status=429), success(), details())
@@ -164,6 +164,50 @@ class CheckinTests(unittest.TestCase):
         self.assertEqual(self.session.request.call_count, checkin.MAX_ATTEMPTS)
         self.assertNotIn("session-value-one", self.output.getvalue())
         self.assertNotIn("signature-value-one", self.output.getvalue())
+
+    def test_checkin_can_wait_for_a_response_slower_than_fifteen_seconds(self):
+        def handle(method, url, **kwargs):
+            if method == "POST":
+                if kwargs["timeout"][1] < 25:
+                    raise requests.ReadTimeout("Response would arrive after 25 seconds")
+                return success()
+            # Optional details keep their shorter timeout.
+            self.assertEqual(kwargs["timeout"], (5, 15))
+            return details()
+
+        self.session.request.side_effect = handle
+        self.assertEqual(checkin.main(), 0)
+        self.assertEqual(self.session.request.call_count, 2)
+        self.sleep.assert_not_called()
+
+    def test_read_timeout_then_already_checked_in_is_successful(self):
+        # The first POST may have reached the service even if its response was lost.
+        self.supply(requests.ReadTimeout(COOKIE), response({"code": 1,
+            "message": "Today's observation logged. Return tomorrow for more points."}), details())
+        self.assertEqual(checkin.main(), 0)
+        self.assertIn("✅0 ❌0 🔁1", self.send.call_args.args[1])
+        self.sleep.assert_called_once_with(15)
+        self.assertNotIn("session-value-one", self.output.getvalue())
+
+    def test_three_read_timeouts_fail_with_bounded_backoff_and_network_notice(self):
+        self.supply(*[requests.ReadTimeout(COOKIE) for _ in range(3)])
+        self.assertEqual(checkin.main(), 1)
+        self.assertEqual(self.session.request.call_count, 3)
+        self.assertEqual(self.sleep.call_args_list, [call(15), call(30)])
+        for request in self.session.request.call_args_list:
+            self.assertEqual(request.kwargs["timeout"], (10, 60))
+        self.send.assert_called_once()
+        self.assertIn("网络超时", self.send.call_args.args[2])
+        self.assertNotIn("更新 COOKIES", self.send.call_args.args[2])
+        self.assertNotIn("session-value-one", self.output.getvalue())
+        self.assertNotIn("signature-value-one", self.output.getvalue())
+
+    def test_optional_details_timeout_does_not_turn_checkin_red(self):
+        self.supply(success(), *[requests.ReadTimeout(COOKIE) for _ in range(3)])
+        self.assertEqual(checkin.main(), 0)
+        self.assertIn("✅1 ❌0 🔁0", self.send.call_args.args[1])
+        for request in self.session.request.call_args_list[1:]:
+            self.assertEqual(request.kwargs["timeout"], (5, 15))
 
     def test_non_json_and_wrong_json_type_fail(self):
         for item in (response(body="<html>gateway error</html>"), response([])):
