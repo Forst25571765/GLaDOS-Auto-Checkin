@@ -161,7 +161,7 @@ class CheckinTests(unittest.TestCase):
         self.assertEqual(attempts[1].kwargs["json"]["nonce"], "first-attempt-nonce")
         self.assertEqual(attempts[3].kwargs["json"]["nonce"], "second-attempt-nonce")
         self.assertNotEqual(attempts[1].kwargs["json"]["proof"], attempts[3].kwargs["json"]["proof"])
-        self.assertEqual(self.sleep.call_args_list, [call(2.7), call(15), call(2.7)])
+        self.assertEqual(self.sleep.call_args_list, [call(4.0), call(15), call(4.0)])
 
     def test_rate_limit_retries_then_succeeds(self):
         self.supply(response({}, status=429), challenge(), success(), details())
@@ -190,7 +190,7 @@ class CheckinTests(unittest.TestCase):
         self.session.request.side_effect = handle
         self.assertEqual(checkin.main(), 0)
         self.assertEqual(self.session.request.call_count, 3)
-        self.sleep.assert_called_once_with(2.7)
+        self.sleep.assert_called_once_with(4.0)
 
     def test_read_timeout_then_already_checked_in_is_successful(self):
         # The first POST may have reached the service even if its response was lost.
@@ -199,7 +199,7 @@ class CheckinTests(unittest.TestCase):
             "message": "Today's observation logged. Return tomorrow for more points."}), details())
         self.assertEqual(checkin.main(), 0)
         self.assertIn("✅0 ❌0 🔁1", self.send.call_args.args[1])
-        self.assertEqual(self.sleep.call_args_list, [call(2.7), call(15), call(2.7)])
+        self.assertEqual(self.sleep.call_args_list, [call(4.0), call(15), call(4.0)])
         self.assertNotIn("session-value-one", self.output.getvalue())
 
     def test_three_read_timeouts_fail_with_bounded_backoff_and_network_notice(self):
@@ -309,7 +309,7 @@ class CheckinTests(unittest.TestCase):
                 return challenge()
             if url == checkin.CHECKIN_URL:
                 self.assertEqual(method, "POST")
-                self.sleep.assert_called_once_with(2.7)
+                self.sleep.assert_called_once_with(4.0)
                 self.assertEqual(kwargs["json"], {
                     "token": "glados.cloud", "nonce": "offline-fixture-nonce",
                     "proof": "f9aa298c6ed1d365d2dd3a47b4901c77492553ecd48ad87dba58ceef12d5e837",
@@ -331,6 +331,13 @@ class CheckinTests(unittest.TestCase):
                 self.session.request.assert_called_once()
                 self.assertEqual(self.session.request.call_args.args, ("GET", checkin.CHALLENGE_URL))
         self.sleep.assert_not_called()
+
+    def test_short_challenge_uses_the_original_wait(self):
+        self.supply(challenge(ttl=3500), success(), details())
+        with patch.object(checkin.time, "monotonic", side_effect=[10.0, 10.4, 13.1]):
+            self.assertEqual(checkin.main(), 0)
+        self.sleep.assert_called_once_with(2.7)
+        self.assertEqual(self.session.request.call_args_list[1].args, ("POST", checkin.CHECKIN_URL))
 
     def test_expiry_during_wait_prevents_submission(self):
         self.supply(challenge(ttl=5000))

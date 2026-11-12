@@ -21,7 +21,8 @@ HEADERS_BASE = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
 }
-CHECKIN_CHALLENGE_DELAY = 2.7
+CHECKIN_CHALLENGE_DELAY = 4.0
+CHECKIN_CHALLENGE_SHORT_DELAY = 2.7
 DEFAULT_CHALLENGE_TTL_MS = 300_000
 TIMEOUT = (5, 15)
 # Allow slow check-in responses while keeping the shorter timeout for
@@ -114,11 +115,16 @@ def submit_checkin(session, headers):
     if (classify_checkin(code) != "ok" or not isinstance(nonce, str) or not 0 < len(nonce) <= 4096
             or type(ttl) not in (int, float) or (type(ttl) is float and not math.isfinite(ttl))):
         raise CheckinChallengeError("未取得有效的签到验证，请查看官网签到页面")
-    if (time.monotonic() - started_at + CHECKIN_CHALLENGE_DELAY) * 1000 >= ttl:
+    elapsed_ms = (time.monotonic() - started_at) * 1000
+    delay = CHECKIN_CHALLENGE_DELAY
+    if elapsed_ms + delay * 1000 >= ttl:
+        delay = CHECKIN_CHALLENGE_SHORT_DELAY
+    if elapsed_ms + delay * 1000 >= ttl:
         raise CheckinChallengeError("签到验证剩余时间不足，请稍后重跑")
 
     # Follow the console's wait before submitting the server-issued nonce.
-    time.sleep(CHECKIN_CHALLENGE_DELAY)
+    print(f"CHECKIN_CHALLENGE_WAIT: {delay:g}s")
+    time.sleep(delay)
     if (time.monotonic() - started_at) * 1000 >= ttl:
         raise CheckinChallengeError("签到验证已过期，请稍后重跑")
     proof = hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest()

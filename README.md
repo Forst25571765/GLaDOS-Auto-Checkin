@@ -65,7 +65,7 @@ gld:sess=account2; gld:sess.sig=signature2
 
 ### 签到积分与一次性校验
 
-签到时先向 GLaDOS 获取本次的一次性校验参数，等待 2.7 秒后在同一站点提交。网络错误触发重试时会重新获取参数。参数缺失或过期会记录失败，避免用旧的签到方式占用当天首次签到。实现参考社区的 [一次性校验适配](https://github.com/lankerr/2026-glados-checkin/pull/31) 和 [等待余量修订](https://github.com/lankerr/2026-glados-checkin/pull/33)。
+签到时先向 GLaDOS 获取本次的一次性校验参数，通常等待 4 秒后在同一站点提交。有效期剩余不足以等待 4 秒时，使用原来的 2.7 秒。剩余时间不足或等待后已过期时停止提交。网络错误触发重试时会重新获取参数。实现参考社区的 [一次性校验适配](https://github.com/lankerr/2026-glados-checkin/pull/31) 和 [等待余量修订](https://github.com/lankerr/2026-glados-checkin/pull/33)。
 
 积分由服务端结算。升级后请看下一次首次签到的 `CHECKIN_RESP` 和官网积分流水。当天已经记账时，手动运行返回 `code: 1` 表示当天已签到。
 
