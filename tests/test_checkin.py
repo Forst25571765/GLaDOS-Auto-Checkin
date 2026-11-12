@@ -30,6 +30,10 @@ def success():
     return response({"code": 0, "points": 12, "message": "Checkin! Got 12 Points"})
 
 
+def challenge(nonce="offline-fixture-nonce", ttl=300_000):
+    return response({"code": 0, "nonce": nonce, "ttl": ttl})
+
+
 def details():
     return response({"data": {"email": "example@example.com", "leftDays": "70.9"}})
 
@@ -102,7 +106,7 @@ class CheckinTests(unittest.TestCase):
         self.assertIn("未检测到 COOKIES", self.send.call_args.args[2])
 
     def test_success_notifies_existing_sendkey_and_returns_zero(self):
-        self.supply(success(), details())
+        self.supply(challenge(), success(), details())
         self.assertEqual(checkin.main(), 0)
         self.send.assert_called_once_with(SENDKEY, "GLaDOS 签到完成 ✅1 ❌0 🔁0",
             "1. ex***@example.com | ✅ 成功 | P:12 | 剩余:70 天", {"tags": "GLaDOS|签到"})
@@ -110,7 +114,7 @@ class CheckinTests(unittest.TestCase):
         self.assertNotIn("example@example.com", self.output.getvalue())
 
     def test_observation_logged_is_already_checked_in(self):
-        self.supply(response({"code": 1, "points": 0,
+        self.supply(challenge(), response({"code": 1, "points": 0,
             "message": "Today's observation logged. Return tomorrow for more points."}), details())
         self.assertEqual(checkin.main(), 0)
         self.assertIn("✅0 ❌0 🔁1", self.send.call_args.args[1])
@@ -123,14 +127,15 @@ class CheckinTests(unittest.TestCase):
         self.assertIn("更新 COOKIES", self.send.call_args.args[2])
 
     def test_automated_checkin_rejection_is_a_failure(self):
-        self.supply(response({"code": 4, "message": "Automated check-in detected. Please sign in again to continue."}))
+        self.supply(challenge(), response({"code": 4, "message": "Automated check-in detected. Please sign in again to continue."}))
         self.assertEqual(checkin.main(), 1)
-        self.assertEqual(self.session.request.call_count, 1)
+        self.assertEqual(self.session.request.call_count, 2)
+        self.assertIn("请在官网完成签到", self.send.call_args.args[2])
 
     def test_failure_code_cannot_be_overridden_by_got_in_message(self):
         for code in (-2, 4, None, "invalid", True):
             with self.subTest(code=code):
-                self.supply(response({"code": code, "message": "got 12 points"}))
+                self.supply(challenge(), response({"code": code, "message": "got 12 points"}))
                 self.assertEqual(checkin.main(), 1)
 
     def test_numeric_string_response_codes(self):
@@ -148,15 +153,20 @@ class CheckinTests(unittest.TestCase):
                 self.assertIn("更新 COOKIES", self.send.call_args.args[2])
 
     def test_temporary_http_failure_retries_then_succeeds(self):
-        self.supply(response({}, status=503), success(), details())
+        self.supply(challenge("first-attempt-nonce"), response({}, status=503),
+                    challenge("second-attempt-nonce"), success(), details())
         self.assertEqual(checkin.main(), 0)
-        self.assertEqual(self.session.request.call_count, 3)
-        self.sleep.assert_called_once_with(15)
+        attempts = self.session.request.call_args_list
+        self.assertEqual([req.args[0] for req in attempts], ["GET", "POST", "GET", "POST", "GET"])
+        self.assertEqual(attempts[1].kwargs["json"]["nonce"], "first-attempt-nonce")
+        self.assertEqual(attempts[3].kwargs["json"]["nonce"], "second-attempt-nonce")
+        self.assertNotEqual(attempts[1].kwargs["json"]["proof"], attempts[3].kwargs["json"]["proof"])
+        self.assertEqual(self.sleep.call_args_list, [call(2.7), call(15), call(2.7)])
 
     def test_rate_limit_retries_then_succeeds(self):
-        self.supply(response({}, status=429), success(), details())
+        self.supply(response({}, status=429), challenge(), success(), details())
         self.assertEqual(checkin.main(), 0)
-        self.assertEqual(self.session.request.call_count, 3)
+        self.assertEqual(self.session.request.call_count, 4)
 
     def test_exhausted_network_errors_fail_without_leaking_cookie(self):
         self.supply(*[requests.Timeout(COOKIE) for _ in range(checkin.MAX_ATTEMPTS)])
@@ -167,6 +177,8 @@ class CheckinTests(unittest.TestCase):
 
     def test_checkin_can_wait_for_a_response_slower_than_fifteen_seconds(self):
         def handle(method, url, **kwargs):
+            if url == checkin.CHALLENGE_URL:
+                return challenge()
             if method == "POST":
                 if kwargs["timeout"][1] < 25:
                     raise requests.ReadTimeout("Response would arrive after 25 seconds")
@@ -177,16 +189,17 @@ class CheckinTests(unittest.TestCase):
 
         self.session.request.side_effect = handle
         self.assertEqual(checkin.main(), 0)
-        self.assertEqual(self.session.request.call_count, 2)
-        self.sleep.assert_not_called()
+        self.assertEqual(self.session.request.call_count, 3)
+        self.sleep.assert_called_once_with(2.7)
 
     def test_read_timeout_then_already_checked_in_is_successful(self):
         # The first POST may have reached the service even if its response was lost.
-        self.supply(requests.ReadTimeout(COOKIE), response({"code": 1,
+        self.supply(challenge("timeout-nonce"), requests.ReadTimeout(COOKIE),
+                    challenge("retry-nonce"), response({"code": 1,
             "message": "Today's observation logged. Return tomorrow for more points."}), details())
         self.assertEqual(checkin.main(), 0)
         self.assertIn("✅0 ❌0 🔁1", self.send.call_args.args[1])
-        self.sleep.assert_called_once_with(15)
+        self.assertEqual(self.sleep.call_args_list, [call(2.7), call(15), call(2.7)])
         self.assertNotIn("session-value-one", self.output.getvalue())
 
     def test_three_read_timeouts_fail_with_bounded_backoff_and_network_notice(self):
@@ -203,10 +216,10 @@ class CheckinTests(unittest.TestCase):
         self.assertNotIn("signature-value-one", self.output.getvalue())
 
     def test_optional_details_timeout_does_not_turn_checkin_red(self):
-        self.supply(success(), *[requests.ReadTimeout(COOKIE) for _ in range(3)])
+        self.supply(challenge(), success(), *[requests.ReadTimeout(COOKIE) for _ in range(3)])
         self.assertEqual(checkin.main(), 0)
         self.assertIn("✅1 ❌0 🔁0", self.send.call_args.args[1])
-        for request in self.session.request.call_args_list[1:]:
+        for request in self.session.request.call_args_list[2:]:
             self.assertEqual(request.kwargs["timeout"], (5, 15))
 
     def test_non_json_and_wrong_json_type_fail(self):
@@ -219,16 +232,16 @@ class CheckinTests(unittest.TestCase):
     def test_status_query_failures_do_not_overwrite_success(self):
         for item in (response({}, status=403), response({"data": {"leftDays": "invalid"}})):
             with self.subTest(response=item.text):
-                self.supply(success(), item)
+                self.supply(challenge(), success(), item)
                 self.assertEqual(checkin.main(), 0)
                 self.assertIn("✅1 ❌0 🔁0", self.send.call_args.args[1])
 
     def test_partial_failure_is_red_and_remaining_accounts_are_processed(self):
         with patch.dict(os.environ, {"COOKIES": COOKIE + "\n" + COOKIE_TWO + "\n" + COOKIE}):
-            self.supply(success(), details(), auth_failure(),
+            self.supply(challenge(), success(), details(), auth_failure(), challenge(),
                 response({"code": 1, "message": "Today's observation logged."}), details())
             self.assertEqual(checkin.main(), 1)
-        self.assertEqual(self.session.request.call_count, 5)
+        self.assertEqual(self.session.request.call_count, 7)
         self.assertIn("✅1 ❌1 🔁1", self.send.call_args.args[1])
 
     def test_each_account_has_its_own_cookie_header_and_clears_session(self):
@@ -236,9 +249,10 @@ class CheckinTests(unittest.TestCase):
 
         def handle(method, url, **kwargs):
             seen_headers.append(kwargs["headers"]["cookie"])
-            if method == "POST":
+            if url == checkin.CHALLENGE_URL:
                 self.assertEqual(len(self.session.cookies), 0)
-                self.assertEqual(kwargs["json"], {"token": "glados.cloud"})
+                return challenge()
+            if method == "POST":
                 self.session.cookies.set("server-set", "previous-account")
                 return success()
             return details()
@@ -246,11 +260,11 @@ class CheckinTests(unittest.TestCase):
         self.session.request.side_effect = handle
         with patch.dict(os.environ, {"COOKIES": COOKIE + " & " + COOKIE_TWO}):
             self.assertEqual(checkin.main(), 0)
-        self.assertEqual(seen_headers, [COOKIE, COOKIE, COOKIE_TWO, COOKIE_TWO])
+        self.assertEqual(seen_headers, [COOKIE] * 3 + [COOKIE_TWO] * 3)
 
     def test_notification_error_does_not_change_business_result_or_log_sendkey(self):
         self.send.side_effect = RuntimeError(SENDKEY)
-        self.supply(success(), details())
+        self.supply(challenge(), success(), details())
         self.assertEqual(checkin.main(), 0)
         self.supply(auth_failure())
         self.assertEqual(checkin.main(), 1)
@@ -258,7 +272,7 @@ class CheckinTests(unittest.TestCase):
 
     def test_serverchan_api_error_is_not_reported_as_notification_success(self):
         self.send.return_value = {"code": 40001}
-        self.supply(success(), details())
+        self.supply(challenge(), success(), details())
         self.assertEqual(checkin.main(), 0)
         self.assertIn("Server酱推送失败", self.output.getvalue())
         self.assertNotIn("微信推送完成", self.output.getvalue())
@@ -266,14 +280,14 @@ class CheckinTests(unittest.TestCase):
     def test_telegram_and_sct_can_both_receive_the_summary(self):
         self.telegram.side_effect = None
         self.telegram.return_value = response({"ok": True})
-        self.supply(success(), details())
+        self.supply(challenge(), success(), details())
         with patch.dict(os.environ, {"TG_BOT_TOKEN": "test-bot", "TG_CHAT_ID": "123"}):
             self.assertEqual(checkin.main(), 0)
         self.telegram.assert_called_once()
         self.send.assert_called_once()
 
     def test_response_message_does_not_log_session_credentials(self):
-        self.supply(response({"code": 4, "message": "rejected session-value-one signature-value-one"}))
+        self.supply(challenge(), response({"code": 4, "message": "rejected session-value-one signature-value-one"}))
         self.assertEqual(checkin.main(), 1)
         self.assertNotIn("session-value-one", self.output.getvalue())
         self.assertNotIn("signature-value-one", self.output.getvalue())
@@ -285,6 +299,70 @@ class CheckinTests(unittest.TestCase):
                 runpy.run_path(str(Path(checkin.__file__)), run_name="__main__")
         self.assertEqual(caught.exception.code, 1)
         self.send.assert_called_once()
+
+    def test_first_checkin_uses_the_issued_nonce_after_the_wait(self):
+        def handle(method, url, **kwargs):
+            if url == checkin.CHALLENGE_URL:
+                self.assertEqual(method, "GET")
+                self.assertNotIn("json", kwargs)
+                self.sleep.assert_not_called()
+                return challenge()
+            if url == checkin.CHECKIN_URL:
+                self.assertEqual(method, "POST")
+                self.sleep.assert_called_once_with(2.7)
+                self.assertEqual(kwargs["json"], {
+                    "token": "glados.cloud", "nonce": "offline-fixture-nonce",
+                    "proof": "f9aa298c6ed1d365d2dd3a47b4901c77492553ecd48ad87dba58ceef12d5e837",
+                })
+                return success()
+            return details()
+
+        self.session.request.side_effect = handle
+        self.assertEqual(checkin.main(), 0)
+        self.assertEqual(self.session.request.call_count, 3)
+
+    def test_missing_or_invalid_challenge_never_posts_a_legacy_checkin(self):
+        for item in (response({"code": 0}), challenge(ttl=1000), challenge(ttl=True),
+                     challenge(ttl=float("inf")), response({}, status=404)):
+            with self.subTest(response=item.text, http_status=item.status_code):
+                self.session.request.reset_mock()
+                self.supply(item)
+                self.assertEqual(checkin.main(), 1)
+                self.session.request.assert_called_once()
+                self.assertEqual(self.session.request.call_args.args, ("GET", checkin.CHALLENGE_URL))
+        self.sleep.assert_not_called()
+
+    def test_expiry_during_wait_prevents_submission(self):
+        self.supply(challenge(ttl=5000))
+        with patch.object(checkin.time, "monotonic", side_effect=[10, 10, 16]):
+            self.assertEqual(checkin.main(), 1)
+        self.session.request.assert_called_once()
+        self.assertIn("签到验证已过期", self.send.call_args.args[2])
+
+    def test_challenge_redirect_is_not_followed(self):
+        redirected = response({}, status=302)
+        redirected.headers["Location"] = "https://example.invalid/checkin"
+        self.supply(redirected)
+        self.assertEqual(checkin.main(), 1)
+        self.session.request.assert_called_once()
+        self.assertFalse(self.session.request.call_args.kwargs["allow_redirects"])
+
+    def test_server_echo_of_challenge_secrets_is_redacted(self):
+        secrets = []
+
+        def handle(method, url, **kwargs):
+            if url == checkin.CHALLENGE_URL:
+                return challenge()
+            values = kwargs["json"]
+            secrets.extend([values["nonce"], values["proof"]])
+            return response({"code": 7, "message": "invalid " + " ".join(secrets)})
+
+        self.session.request.side_effect = handle
+        self.assertEqual(checkin.main(), 1)
+        self.assertEqual(len(secrets), 2)
+        for secret in secrets:
+            self.assertNotIn(secret, self.output.getvalue())
+            self.assertNotIn(secret, self.send.call_args.args[2])
 
 
 if __name__ == "__main__":

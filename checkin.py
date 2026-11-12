@@ -1,3 +1,5 @@
+import hashlib
+import math
 import os
 import random
 import re
@@ -8,6 +10,7 @@ import requests
 from serverchan_sdk import sc_send
 
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
+CHALLENGE_URL = f"{CHECKIN_URL}/challenge"
 STATUS_URL = "https://glados.cloud/api/user/status"
 HEADERS_BASE = {
     "origin": "https://glados.cloud",
@@ -18,7 +21,8 @@ HEADERS_BASE = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
 }
-PAYLOAD = {"token": "glados.cloud"}
+CHECKIN_CHALLENGE_DELAY = 2.7
+DEFAULT_CHALLENGE_TTL_MS = 300_000
 TIMEOUT = (5, 15)
 # Allow slow check-in responses while keeping the shorter timeout for
 # optional account queries and Telegram requests.
@@ -26,6 +30,10 @@ CHECKIN_TIMEOUT = (10, 60)
 MAX_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 15
 SESSION_KEY = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess(?P<sig>\.sig)?$")
+
+
+class CheckinChallengeError(ValueError):
+    """The service did not provide a usable check-in challenge."""
 
 
 def normalize_cookie(cookie):
@@ -78,6 +86,50 @@ def safe_json(response):
         return {}
 
 
+def request_json_once(session, method, url, headers, timeout, label, payload=None):
+    kwargs = {"headers": headers, "timeout": timeout, "allow_redirects": False}
+    if payload is not None:
+        kwargs["json"] = payload
+    response = session.request(method, url, **kwargs)
+    print(f"{label}_STATUS:", response.status_code)
+    if 300 <= response.status_code < 400:
+        raise requests.HTTPError("Unexpected redirect", response=response)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object")
+    return data
+
+
+def submit_checkin(session, headers):
+    """Obtain and submit one server-issued challenge on the same session."""
+    started_at = time.monotonic()
+    challenge = request_json_once(session, "GET", CHALLENGE_URL, headers,
+                                  CHECKIN_TIMEOUT, "CHECKIN_CHALLENGE")
+    code = challenge.get("code")
+    nonce = challenge.get("nonce")
+    if code in (-2, "-2", 4, "4"):
+        return {"code": code, "message": redact_message(challenge.get("message"), headers["cookie"], nonce)}
+    ttl = challenge.get("ttl", DEFAULT_CHALLENGE_TTL_MS)
+    if (classify_checkin(code) != "ok" or not isinstance(nonce, str) or not 0 < len(nonce) <= 4096
+            or type(ttl) not in (int, float) or (type(ttl) is float and not math.isfinite(ttl))):
+        raise CheckinChallengeError("未取得有效的签到验证，请查看官网签到页面")
+    if (time.monotonic() - started_at + CHECKIN_CHALLENGE_DELAY) * 1000 >= ttl:
+        raise CheckinChallengeError("签到验证剩余时间不足，请稍后重跑")
+
+    # Follow the console's wait before submitting the server-issued nonce.
+    time.sleep(CHECKIN_CHALLENGE_DELAY)
+    if (time.monotonic() - started_at) * 1000 >= ttl:
+        raise CheckinChallengeError("签到验证已过期，请稍后重跑")
+    proof = hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest()
+    result = request_json_once(session, "POST", CHECKIN_URL, headers, CHECKIN_TIMEOUT, "CHECKIN",
+                               {"token": "glados.cloud", "nonce": nonce, "proof": proof})
+    for field in ("message", "points"):
+        if isinstance(result.get(field), str):
+            result[field] = redact_message(result[field], headers["cookie"], nonce, proof)
+    return result
+
+
 def request_json(session, method, url, headers):
     timeout = CHECKIN_TIMEOUT if url == CHECKIN_URL else TIMEOUT
     label = "CHECKIN" if method == "POST" else "ACCOUNT"
@@ -85,16 +137,9 @@ def request_json(session, method, url, headers):
         try:
             print(f"{label}_ATTEMPT: {attempt + 1}/{MAX_ATTEMPTS} "
                   f"(connect={timeout[0]}s, read={timeout[1]}s)")
-            kwargs = {"headers": headers, "timeout": timeout}
-            if method == "POST":
-                kwargs["json"] = PAYLOAD
-            response = session.request(method, url, **kwargs)
-            print(f"{label}_STATUS:", response.status_code)
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict):
-                raise ValueError("Expected a JSON object")
-            return data
+            if method == "POST" and url == CHECKIN_URL:
+                return submit_checkin(session, headers)
+            return request_json_once(session, method, url, headers, timeout, label)
         except requests.RequestException as error:
             response = error.response
             status = response.status_code if response is not None else None
@@ -108,8 +153,11 @@ def request_json(session, method, url, headers):
             time.sleep(delay)
 
 
-def redact_message(message, cookie):
+def redact_message(message, cookie, *extra_secrets):
     message = message if isinstance(message, str) else ""
+    for value in extra_secrets:
+        if isinstance(value, str) and value:
+            message = message.replace(value, "[已隐藏]")
     for part in cookie.split(";"):
         value = part.strip().partition("=")[2]
         if len(value) >= 4:
@@ -139,14 +187,19 @@ def checkin_account(session, cookie, index):
         data = request_json(session, "POST", CHECKIN_URL, headers)
         message = redact_message(data.get("message"), cookie)
         code = data.get("code")
-        print("CHECKIN_RESP:", {"code": code, "message": message})
+        logged_code = code if type(code) is int else None
+        if isinstance(code, str) and re.fullmatch(r"-?[0-9]{1,10}", code.strip()):
+            logged_code = code.strip()
+        print("CHECKIN_RESP:", {"code": logged_code, "message": message})
         account["result"] = classify_checkin(code)
         if account["result"] == "ok":
             account["status"] = "✅ 成功"
         elif account["result"] == "repeat":
             account["status"] = "🔁 已签到"
         else:
-            if code in (-2, "-2") or any(word in message.lower() for word in
+            if code in (4, "4"):
+                account["status"] = "❌ 服务端拒绝本次自动签到，请在官网完成签到"
+            elif code in (-2, "-2") or any(word in message.lower() for word in
                     ("没有权限", "未登录", "unauthorized", "forbidden")):
                 account["status"] = "❌ 鉴权失败：请重新登录并更新 COOKIES"
             else:
@@ -155,6 +208,9 @@ def checkin_account(session, cookie, index):
         points = data.get("points", "-")
         if isinstance(points, (int, float, str)):
             account["points"] = str(points)[:32]
+    except CheckinChallengeError as error:
+        account["status"] = f"❌ {error}"
+        return account
     except Exception as error:
         response = getattr(error, "response", None)
         status = response.status_code if response is not None else None
